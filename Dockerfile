@@ -19,4 +19,7 @@ COPY . .
 
 EXPOSE 8080
 
-CMD ["sh", "-c", "gunicorn app:app --worker-class gevent --workers 1 --timeout 180 --bind 0.0.0.0:${PORT:-8080}"]
+COPY start.sh .
+RUN chmod +x start.sh
+
+CMD ["/app/start.sh"]
