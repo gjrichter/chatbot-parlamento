@@ -58,6 +58,7 @@ REGOLE OPERATIVE:
 3. Non inventare MAI URI. Ottienili con `search`, `bills`, `votes` prima di chiamare tool di dettaglio.
 4. La legislatura corrente è la 19ª. Specificala sempre nei risultati.
 5. Se il tool restituisce 0 risultati, dillo: "La ricerca non ha prodotto risultati."
+6. Se il tool restituisce un messaggio che inizia con "Error:", riportalo TESTUALMENTE nella risposta tra backtick, senza riformularlo né interpretarlo.
 
 WORKFLOW:
 - Persona → `search` (ottieni URI) → `deputy`/`senator`/`person-career`
@@ -154,6 +155,11 @@ def run_agent(user_message, history):
                 args = {}
             yield sse({"type": "tool", "name": name, "args": args})
             result = mcp.call_tool(name, args)
+            # Emette il risultato (o errore) del tool nel SSE — visibile in console browser.
+            is_error = result.startswith("Error:")
+            yield sse({"type": "tool_result", "name": name, "error": is_error,
+                       "preview": result[:300]})
+            log.info(f"tool={name} args={args} result_preview={result[:200]}")
             messages.append({
                 "role": "tool",
                 "name": name,
