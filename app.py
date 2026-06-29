@@ -7,12 +7,18 @@ consultando le votazioni…") sia i token della risposta.
 """
 
 import json
+import logging
 import os
+import threading
+import time
 
 from flask import Flask, Response, render_template, request, stream_with_context
 from mistralai import Mistral
 
 from mcp_client import MCPStdioClient
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -21,10 +27,22 @@ MAX_STEPS = int(os.environ.get("MAX_STEPS", "6"))
 
 client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
 
-# Sottoprocesso MCP avviato all'import del modulo (un worker = un sottoprocesso).
 mcp = MCPStdioClient()
-mcp.start()
-TOOLS = mcp.tool_schemas()
+TOOLS = []
+_mcp_error = None
+
+def _init_mcp():
+    global TOOLS, _mcp_error
+    try:
+        log.info("Avvio server MCP...")
+        mcp.start()
+        TOOLS = mcp.tool_schemas()
+        log.info(f"Server MCP pronto — {len(TOOLS)} tool disponibili.")
+    except Exception as e:
+        _mcp_error = str(e)
+        log.error(f"Errore avvio MCP: {e}")
+
+threading.Thread(target=_init_mcp, daemon=True).start()
 
 SYSTEM_PROMPT = """Sei un assistente esperto del Parlamento italiano. Rispondi sempre in italiano.
 
@@ -49,6 +67,15 @@ def sse(event):
 
 
 def run_agent(user_message, history):
+    # Attende al massimo 60s che il server MCP sia pronto
+    for _ in range(60):
+        if TOOLS:
+            break
+        time.sleep(1)
+    else:
+        yield sse({"type": "error", "message": "Server MCP non disponibile. Riprova tra qualche secondo."})
+        return
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)  # turni precedenti: solo {role: user|assistant, content}
     messages.append({"role": "user", "content": user_message})
@@ -158,7 +185,7 @@ def chat():
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "tools": len(TOOLS)}
+    return {"status": "ok", "tools": len(TOOLS), "mcp_ready": bool(TOOLS), "mcp_error": _mcp_error}
 
 
 if __name__ == "__main__":
