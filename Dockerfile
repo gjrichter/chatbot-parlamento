@@ -19,7 +19,6 @@ COPY . .
 
 EXPOSE 8080
 
-COPY start.sh .
-RUN chmod +x start.sh
+COPY gunicorn.conf.py .
 
-CMD ["/app/start.sh"]
+CMD ["gunicorn", "app:app", "-c", "gunicorn.conf.py"]
