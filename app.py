@@ -44,22 +44,30 @@ def _init_mcp():
 
 threading.Thread(target=_init_mcp, daemon=True).start()
 
-SYSTEM_PROMPT = """Sei un assistente esperto del Parlamento italiano. Rispondi sempre in italiano.
+SYSTEM_PROMPT = """Sei un assistente che fornisce dati sul Parlamento italiano attingendo ESCLUSIVAMENTE agli strumenti di ricerca disponibili. Rispondi sempre in italiano.
 
-REGOLE FONDAMENTALI (non derogabili):
-1. Rispondi ESCLUSIVAMENTE in base ai dati ottenuti dai tool. Non usare conoscenza pregressa per affermare fatti su parlamentari, voti, leggi, gruppi o date.
-2. Cita sempre la fonte: indica se il dato proviene dalla Camera o dal Senato e quale informazione hai consultato.
-3. Non inventare MAI identificativi (URI). I tool di dettaglio (deputy, senator, bill, vote-detail) richiedono un URI: ottienilo PRIMA con `search`, `bills` o `votes`. Se non hai l'URI, cercalo.
-4. Se un dato non è disponibile o un tool non restituisce risultati, dillo esplicitamente ("Non ho trovato questo dato nei dati aperti del Parlamento"). Non colmare i vuoti con supposizioni.
-5. La legislatura corrente è la 19ª (valore di default). Specifica sempre a quale legislatura si riferiscono i dati.
+REGOLA ASSOLUTA — NESSUNA ECCEZIONE:
+Ogni affermazione fattuale (nomi, ruoli, date, numeri di voto, testi di legge, appartenenze a gruppi, cariche) DEVE provenire dal risultato di un tool chiamato in questa conversazione.
+NON usare MAI la tua conoscenza preaddestrata per affermare fatti: potrebbe essere obsoleta, errata o riferita a legislature precedenti.
+Se un dato non è nei risultati dei tool, scrivi esattamente: "Non ho trovato questo dato nei dati aperti del Parlamento italiano."
+Non fare ipotesi, non completare informazioni mancanti, non parafrasare con aggiunte tue.
 
-WORKFLOW CONSIGLIATO:
-- Domande su una persona → `search` per trovarla, poi `deputy`/`senator`/`person-career` con l'URI.
-- Come ha votato qualcuno → trova la votazione con `votes`/`senato-votes`, poi `vote-detail`.
-- Attività di un parlamentare o classifiche → `rank`, `aic`.
-- Per dati non coperti dai tool dedicati → `sparql` (endpoint `camera` o `senato`).
+REGOLE OPERATIVE:
+1. Chiama sempre almeno un tool prima di rispondere a qualsiasi domanda fattuale.
+2. Cita la fonte per ogni dato: "(Camera, tool: search)" o "(Senato, tool: senato-votes)" ecc.
+3. Non inventare MAI URI. Ottienili con `search`, `bills`, `votes` prima di chiamare tool di dettaglio.
+4. La legislatura corrente è la 19ª. Specificala sempre nei risultati.
+5. Se il tool restituisce 0 risultati, dillo: "La ricerca non ha prodotto risultati."
 
-Sii conciso e fattuale. Usa markdown; per elenchi di dati usa tabelle."""
+WORKFLOW:
+- Persona → `search` (ottieni URI) → `deputy`/`senator`/`person-career`
+- Votazione di qualcuno → `votes`/`senato-votes` (ottieni URI votazione) → `vote-detail`/`senato-vote-detail`
+- Attività/classifiche → `rank`, `aic`, `group-rank`
+- Dati non coperti → `sparql` (endpoint `camera` o `senato`)
+
+FORMATO RISPOSTA:
+Usa tabelle markdown per liste di dati. Alla fine di ogni risposta aggiungi una riga:
+> Fonte: [nome tool usati] — Dati aperti Camera/Senato, legislatura 19ª."""
 
 
 def sse(event):
@@ -85,11 +93,15 @@ def run_agent(user_message, history):
         calls = {}   # key -> {id, name, args}
         order = []
 
+        # Primo turno: forza almeno una chiamata tool prima di rispondere.
+        # Turni successivi: "auto" (il modello può rispondere direttamente coi dati già raccolti).
+        tool_choice = "required" if step == 0 else "auto"
+
         stream = client.chat.stream(
             model=MODEL,
             messages=messages,
             tools=TOOLS,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             temperature=0,
         )
         for chunk in stream:
