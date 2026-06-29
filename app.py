@@ -1,0 +1,165 @@
+"""Chatbot Parlamento italiano — Flask + Mistral Large + MCP (italianparliament-mcp).
+
+Loop agentico con function calling: Mistral decide quali tool MCP chiamare,
+il backend li esegue via stdio e ricicla i risultati finché il modello produce
+la risposta finale. Lo streaming SSE porta al browser sia gli stati ("sto
+consultando le votazioni…") sia i token della risposta.
+"""
+
+import json
+import os
+
+from flask import Flask, Response, render_template, request, stream_with_context
+from mistralai import Mistral
+
+from mcp_client import MCPStdioClient
+
+app = Flask(__name__)
+
+MODEL = os.environ.get("MISTRAL_MODEL", "mistral-large-latest")
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "6"))
+
+client = Mistral(api_key=os.environ["MISTRAL_API_KEY"])
+
+# Sottoprocesso MCP avviato all'import del modulo (un worker = un sottoprocesso).
+mcp = MCPStdioClient()
+mcp.start()
+TOOLS = mcp.tool_schemas()
+
+SYSTEM_PROMPT = """Sei un assistente esperto del Parlamento italiano. Rispondi sempre in italiano.
+
+REGOLE FONDAMENTALI (non derogabili):
+1. Rispondi ESCLUSIVAMENTE in base ai dati ottenuti dai tool. Non usare conoscenza pregressa per affermare fatti su parlamentari, voti, leggi, gruppi o date.
+2. Cita sempre la fonte: indica se il dato proviene dalla Camera o dal Senato e quale informazione hai consultato.
+3. Non inventare MAI identificativi (URI). I tool di dettaglio (deputy, senator, bill, vote-detail) richiedono un URI: ottienilo PRIMA con `search`, `bills` o `votes`. Se non hai l'URI, cercalo.
+4. Se un dato non è disponibile o un tool non restituisce risultati, dillo esplicitamente ("Non ho trovato questo dato nei dati aperti del Parlamento"). Non colmare i vuoti con supposizioni.
+5. La legislatura corrente è la 19ª (valore di default). Specifica sempre a quale legislatura si riferiscono i dati.
+
+WORKFLOW CONSIGLIATO:
+- Domande su una persona → `search` per trovarla, poi `deputy`/`senator`/`person-career` con l'URI.
+- Come ha votato qualcuno → trova la votazione con `votes`/`senato-votes`, poi `vote-detail`.
+- Attività di un parlamentare o classifiche → `rank`, `aic`.
+- Per dati non coperti dai tool dedicati → `sparql` (endpoint `camera` o `senato`).
+
+Sii conciso e fattuale. Usa markdown; per elenchi di dati usa tabelle."""
+
+
+def sse(event):
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+def run_agent(user_message, history):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)  # turni precedenti: solo {role: user|assistant, content}
+    messages.append({"role": "user", "content": user_message})
+
+    for step in range(MAX_STEPS):
+        content_parts = []
+        calls = {}   # key -> {id, name, args}
+        order = []
+
+        stream = client.chat.stream(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0,
+        )
+        for chunk in stream:
+            delta = chunk.data.choices[0].delta
+            if getattr(delta, "content", None):
+                content_parts.append(delta.content)
+                yield sse({"type": "token", "text": delta.content})
+            for tc in (getattr(delta, "tool_calls", None) or []):
+                idx = getattr(tc, "index", None)
+                key = idx if idx is not None else len(order)
+                if key not in calls:
+                    calls[key] = {"id": None, "name": None, "args": ""}
+                    order.append(key)
+                slot = calls[key]
+                if getattr(tc, "id", None):
+                    slot["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn:
+                    if getattr(fn, "name", None):
+                        slot["name"] = fn.name
+                    arg = getattr(fn, "arguments", None)
+                    if arg:
+                        slot["args"] += arg if isinstance(arg, str) else json.dumps(arg)
+
+        if not calls:
+            yield sse({"type": "done"})
+            return
+
+        # Messaggio assistant che "rivendica" le tool call (richiesto dall'API).
+        tool_calls = []
+        for key in order:
+            s = calls[key]
+            tool_calls.append({
+                "id": s["id"] or f"call_{step}_{key}",
+                "type": "function",
+                "function": {"name": s["name"], "arguments": s["args"] or "{}"},
+            })
+        messages.append({
+            "role": "assistant",
+            "content": "".join(content_parts),
+            "tool_calls": tool_calls,
+        })
+
+        # Esecuzione dei tool + notifica di stato al browser.
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                args = json.loads(tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            yield sse({"type": "tool", "name": name, "args": args})
+            result = mcp.call_tool(name, args)
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+
+    yield sse({"type": "token",
+               "text": "\n\n_(Limite di passi raggiunto: la richiesta è troppo complessa, prova a restringerla.)_"})
+    yield sse({"type": "done"})
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.get_json(force=True) or {}
+    user_message = (data.get("message") or "").strip()
+    history = data.get("history") or []
+    if not user_message:
+        return Response(sse({"type": "error", "message": "Messaggio vuoto."}),
+                        mimetype="text/event-stream")
+
+    @stream_with_context
+    def generate():
+        try:
+            yield from run_agent(user_message, history)
+        except Exception as e:  # noqa: BLE001 — qualsiasi errore va riportato al client
+            yield sse({"type": "error", "message": str(e)})
+
+    resp = Response(generate(), mimetype="text/event-stream")
+    # Anti-buffering (critico su Railway/reverse-proxy) — vedi chatbot precedente.
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["Connection"] = "keep-alive"
+    return resp
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok", "tools": len(TOOLS)}
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
